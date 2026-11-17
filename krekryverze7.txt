@@ -1,0 +1,1552 @@
+/*
+  OBD jízdy -> Telegram   (verze 7 – OLED 0.96" SSD1306 na desce + tlačítko stránek)
+  ------------------------------------------------------------
+  HW:  ESP32 (původní WROOM-32 / DevKit – NE S3/C3/C6, ty nemají klasický Bluetooth)
+       ELM327 Bluetooth (klasický BT)
+       OLED 0.96" 128x64 SSD1306 na desce (I2C: SDA = GPIO 5, SCL = GPIO 4, adresa 0x3C)
+       Tlačítko stránek: GPIO 13 -> GND (vnitřní pull-up)
+       LED: napájení GPIO 25, OBD GPIO 26, odesílání GPIO 27 (přes rezistor 220 Ω na GND)
+       BOOT tlačítko: GPIO 0
+  IDE: Deska "ESP32 Dev Module"
+       Tools -> Partition Scheme -> "Minimal SPIFFS (1.9MB APP with OTA/190KB SPIFFS)"
+       Knihovny: "Adafruit SSD1306" (přitáhne i Adafruit GFX)
+       Při nahrávání podrž tlačítko BOOT.
+       (kvůli aktualizacím přes internet – jiné schéma aktualizace neumí)
+
+  NASTAVENÍ Z MOBILU:
+  - Nové ESP (nic nenastaveno) samo vytvoří Wi-Fi „OBD-nastaveni“.
+    Připoj se k ní mobilem, otevře se stránka (nebo zadej 192.168.4.1).
+    Vyplň přezdívku, auto, domácí Wi-Fi a token bota -> Uložit.
+  - Znovu otevřít nastavení: 3× rychle za sebou zapnout/vypnout zapalování
+    (každé zapnutí kratší než 20 s), nebo podržet tlačítko BOOT / tlačítko
+    stránek aspoň 2 s.
+    Během nastavení pomalu bliká LED 2.
+
+  JAK TO FUNGUJE:
+  - Po zapnutí se podívá, jestli vidí domácí WiFi.
+      ANO -> předchozí jízda skončila: odešle čekající jízdy, upraví týdenní
+             tabulku, zkontroluje aktualizaci a začne novou jízdu.
+      NE  -> pokračuje v rozjeté jízdě (zastávka v obchodě = pořád jedna jízda).
+  - Když stojíš >3 s, máš za sebou aspoň 1 km a ESP vidí domácí WiFi,
+    ukončí jízdu, restartuje se a hned ji odešle (LED 3 bliká).
+  - Level podle celkem najetých km (Lvl 1–10).
+  - OBD adaptér: připojí se na uloženou adresu (MAC). Když to 3× nevyjde,
+    najde adaptér podle jména a jeho adresu si zapamatuje.
+  - Týdenní tabulka: jedna připnutá zpráva, každý týden jiná disciplína
+    (0–100 -> 0–50 -> najeto km -> znovu). Bot musí umět připínat zprávy.
+
+  TLAČÍTKO STRÁNEK (GPIO 13):
+  - Krátký stisk (< 500 ms): další stránka (zrychlení -> turbo a motor -> chlazení a baterie).
+  - Dlouhý stisk (> 2 s): nastavení (Wi-Fi „OBD-nastaveni“).
+
+  DISPLEJ:
+  - Úvod (~3,5 s): velké „Ahoj“ a jméno, pak lišta načítání.
+  - Kontrola (před jízdou, když stojíš déle než 90 s, při odesílání doma):
+    stav OBD, napětí baterie, Wi-Fi, počet čekajících jízd, verdikt.
+  - Jízda – stránky podle tlačítka:
+      0 Zrychlení: km, živé 0–50 a 0–100, max rychlost
+      1 Turbo a motor: plnicí tlak, zatížení, teplota sání, otáčky
+      2 Chlazení a baterie: chladicí kapalina (+ max), napětí, alternátor, fronta, Wi-Fi
+  - Výstraha přes stránku: chladicí > 105 °C, nebo baterie < 12,5 V při otáčkách > 800.
+  - Displej neumí češtinu, proto se diakritika nevypisuje.
+
+  AKTUALIZACE: ESP se doma podívá na GitHub (version.txt). Když je tam vyšší
+  číslo než FW_VERSION, stáhne firmware.bin a nahraje si ho samo.
+
+  LED: 1 = napájení, 2 = ELM spojené (pomalu bliká = nastavení), 3 = bliká při odesílání
+*/
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <HTTPUpdate.h>
+#include <WebServer.h>
+#include <DNSServer.h>
+#include <Preferences.h>
+#include <time.h>
+#include "BluetoothSerial.h"
+#include "esp_system.h"
+
+// ============ PEVNÉ NASTAVENÍ (stejné pro všechny ESP) ============
+const int   FW_VERSION   = 7;     // při každé nové verzi o 1 víc (a stejné číslo do version.txt)
+const char* OTA_URL      = "https://raw.githubusercontent.com/blazkryst-oss/obd-telegram/main/";
+const char* DEFAULT_CHAT = "-1003235613715";   // ID skupiny
+const char* AP_NAME      = "OBD-nastaveni";    // Wi-Fi pro nastavení z mobilu
+const char* DEFAULT_MAC  = "01:23:45:67:89:BA"; // adresa adaptéru (jiné ESP si najde svůj samo)
+
+const int LED_POWER = 25;
+const int LED_OBD   = 26;
+const int LED_TX    = 27;
+const int BTN_BOOT  = 0;
+const int BTN_PAGE  = 13;             // tlačítko přepínání stránek (proti GND)
+
+// OLED na desce ESP32 s 0.96" displejem (podle specifikace výrobce)
+const int OLED_SDA  = 5;
+const int OLED_SCL  = 4;
+const int OLED_RST  = -1;             // reset displeje není zapojen
+const int OLED_ADDR = 0x3C;
+const int OLED_W    = 128;
+const int OLED_H    = 64;
+
+const float   MIN_TRIP_KM     = 0.3;  // kratší jízdy (přeparkování) se neposílají
+const float   ARRIVE_CHECK_KM = 1.0;  // od kolika km hledat domácí WiFi při stání
+const uint8_t MAX_QUEUE       = 8;    // kolik jízd max. čeká na odeslání
+const int     LB_MAX          = 25;   // max lidí v tabulce
+const uint32_t STOJI_MS       = 90000; // po tolika ms stání se ukáže obrazovka kontroly
+
+// hranice levelů v km (Lvl 1 … Lvl 10)
+const uint32_t LVL_KM[10] = {0, 500, 1000, 2000, 3500, 7000, 13000, 25000, 50000, 100000};
+
+// meze pro výstrahu
+const int     VAROVANI_COOL_C = 105;  // °C chladicí kapaliny
+const uint16_t VAROVANI_BAT_MV = 12500; // mV při běžícím motoru
+// ===================================================================
+
+struct Config {
+  String name, car, ssid, pass, token, chat, elm, pin, mac;
+};
+
+struct Trip {
+  uint8_t  open, mil, dtc, obdOk, recFlags, spare;
+  int16_t  maxCoolant;
+  uint32_t onSec, movingMs;
+  float    distKm, totalKm;         // totalKm = celkem najeto po této jízdě (pro level)
+  uint16_t maxSpeed, maxRpm, battLast, prevMaxSpeed;
+  uint32_t best050, best0100, prev050, prev0100;
+};
+
+struct Records {
+  uint32_t best050, best0100;
+  uint16_t maxSpeed;
+};
+
+struct LbRow { String label; float val; };
+
+String jsonStr(const String& js, int i);
+String htmlEsc(String s);
+
+BluetoothSerial SerialBT;
+Preferences prefs;
+Config  cfg;
+String  chatId;
+uint32_t tgDate = 0;              // čas ze serveru Telegramu (záloha)
+
+Trip    trip;
+Records rec;
+Trip    queue[MAX_QUEUE];
+uint8_t qCount = 0;
+uint32_t onBase = 0;
+
+LbRow lb[LB_MAX];
+int   lbN = 0;
+
+WebServer web(80);
+DNSServer dns;
+String   wifiOptions;
+uint32_t portalActivity = 0;
+
+volatile uint8_t wifiDuvod = 0;   // důvod odpojení od Wi-Fi (z ESP32)
+int8_t   homeRssi = 0;            // síla signálu domácí Wi-Fi z posledního hledání
+int32_t  homeCh = 0;              // kanál a adresa nejsilnějšího vysílače
+uint8_t  homeBssid[6];
+
+volatile uint8_t obdLed = 0;      // 2 = ELM připojeno, 3 = režim nastavení (bliká)
+volatile bool    txLed  = false;
+
+bool    btConnected = false;
+uint8_t errStreak   = 0;
+
+int      prevSpeed = 0;
+uint32_t prevSpeedMs = 0, lastZeroMs = 0, zeroSince = 0, lastMoveMs = 0;
+bool     runActive = false, got50 = false;
+uint32_t runStart = 0;
+uint32_t run050 = 0, run0100 = 0; // časy posledního rozjezdu pro displej (0 = zatím ne)
+bool     saveNow = false;
+
+// živá data pro displej (aktualizují se ve smyčce)
+uint16_t liveRpm  = 0;            // ot/min
+uint8_t  liveLoad = 0;            // zatížení motoru v %
+int      liveIat  = 0;            // teplota nasávaného vzduchu °C
+int      liveMap  = 100;          // tlak v sání kPa (100 = bez přeplňování, ~atmosféra)
+int      liveCool = 0;            // teplota chladicí kapaliny °C
+
+// fáze pro displej: 0 = jízda / čekání na OBD, 1 = odesílání, 2 = hotovo (můžeš vypnout),
+//                   4 = odeslání nejde
+uint8_t  faze = 0;
+
+// stránka jízdního displeje: 0 = zrychlení, 1 = turbo a motor, 2 = chlazení a baterie
+volatile uint8_t stranka = 0;
+volatile bool    portalReq = false;   // dlouhý stisk tlačítka stránek -> nastavení
+
+// OLED displej
+Adafruit_SSD1306 oled(OLED_W, OLED_H, &Wire, OLED_RST);
+bool oledOk = false;
+
+// ---------------------- LED ----------------------
+void ledTask(void*) {
+  uint32_t k = 0;
+  for (;;) {
+    k++;
+    digitalWrite(LED_POWER, HIGH);
+    if (obdLed == 3) digitalWrite(LED_OBD, (k / 5) % 2);
+    else digitalWrite(LED_OBD, obdLed == 2 ? HIGH : LOW);
+    digitalWrite(LED_TX, txLed ? (k % 2) : LOW);
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+}
+
+// ---------------------- tlačítko stránek (GPIO 13) ----------------------
+// krátký stisk (< 500 ms) = další stránka, dlouhý (> 2 s) = nastavení
+void btnTask(void*) {
+  bool stabilni = HIGH, posledni = HIGH, dlouhy = false;
+  uint32_t zmena = 0, stisk = 0;
+  for (;;) {
+    uint32_t now = millis();
+    bool r = digitalRead(BTN_PAGE);
+    if (r != posledni) { posledni = r; zmena = now; }
+    if (now - zmena > 30 && r != stabilni) {       // zákmity: stav musí držet 30 ms
+      stabilni = r;
+      if (stabilni == LOW) { stisk = now; dlouhy = false; }
+      else if (!dlouhy && now - stisk < 500) stranka = (stranka + 1) % 3;
+    }
+    if (stabilni == LOW && !dlouhy && now - stisk > 2000) {
+      dlouhy = true;
+      portalReq = true;
+    }
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+
+// ---------------------- konfigurace ----------------------
+void loadCfg() {
+  Preferences p;
+  p.begin("cfg", false);
+  cfg.name  = p.getString("name", "");
+  cfg.car   = p.getString("car", "");
+  cfg.ssid  = p.getString("ssid", "");
+  cfg.pass  = p.getString("pass", "");
+  cfg.token = p.getString("token", "");
+  cfg.chat  = p.getString("chat", DEFAULT_CHAT);
+  cfg.elm   = p.getString("elm", "OBDII");
+  cfg.pin   = p.getString("pin", "1234");
+  cfg.mac   = p.getString("mac", "");
+  if (!cfg.mac.length()) cfg.mac = DEFAULT_MAC;
+  p.end();
+  chatId = cfg.chat;
+}
+
+void saveCfgKey(const char* key, const String& val) {
+  Preferences p;
+  p.begin("cfg", false);
+  p.putString(key, val);
+  p.end();
+}
+
+bool configured() { return cfg.name.length() && cfg.ssid.length() && cfg.token.length(); }
+
+// ---------------------- diagnostika (zobrazí se na stránce nastavení) ----------------------
+// obdSt: 0 = ještě nezkoušeno, 1 = adaptér nenalezen, 2 = adaptér spojen, auto neodpovídá, 3 = OK
+void setObdSt(uint8_t st) {
+  static uint8_t last = 255;
+  if (st == last) return;
+  last = st;
+  if (prefs.getUChar("obdSt", 0) != st) prefs.putUChar("obdSt", st);
+}
+
+// wifiSt: 0 = ještě nezkoušeno, 1 = nepřipojilo se, 2 = OK
+void setWifiSt(uint8_t st) {
+  if (prefs.getUChar("wifiSt", 0) != st) prefs.putUChar("wifiSt", st);
+}
+
+String duvodText(uint8_t d) {
+  if (d == 202) return "špatné heslo";
+  if (d == 15 || d == 204) return "špatné heslo nebo slabý signál";
+  if (d == 201) return "síť nenalezena";
+  if (d == 200 || d == 203 || d == 2 || d == 4 || d == 8) return "slabý signál";
+  if (d == 0) return "vypršel čas";
+  return "kód " + String(d);
+}
+
+String signalText(int r) {
+  if (!r) return "";
+  String q = r >= -67 ? "dobrý" : r >= -80 ? "slabý" : "velmi slabý";
+  return " · signál " + String(r) + " dBm (" + q + ")";
+}
+
+String diagHtml() {
+  uint8_t o = prefs.getUChar("obdSt", 0), w = prefs.getUChar("wifiSt", 0);
+  String tg = prefs.getString("tgSt", "");
+  int q = prefs.getBytesLength("queue") / sizeof(Trip);
+  String h = "<div class='diag'>";
+  h += "OBD: ";
+  h += o == 3 ? "✅ spojeno" : o == 2 ? "⚠️ adaptér spojen, auto neodpovídá" :
+       o == 1 ? "❌ adaptér nenalezen" : "– zatím nezkoušeno";
+  h += "<br>Domácí Wi-Fi: ";
+  if (w == 2) h += "✅ připojeno";
+  else if (w == 1) h += "❌ nepřipojilo se – " + duvodText(prefs.getUChar("wifiDuv", 0));
+  else h += "– zatím nezkoušeno";
+  h += signalText((int8_t)prefs.getChar("rssi", 0));
+  h += "<br>Telegram: ";
+  h += !tg.length() ? String("– zatím nic neposláno") : tg == "OK" ? String("✅ OK") : "❌ " + htmlEsc(tg);
+  h += "<br>Čeká na odeslání: " + String(q);
+  h += "</div>";
+  return h;
+}
+
+// ---------------------- levely ----------------------
+int levelFor(float km) {
+  int l = 1;
+  for (int i = 1; i < 10; i++) if (km >= LVL_KM[i]) l = i + 1;
+  return l;
+}
+
+const char* levelIcon(int l) {
+  if (l <= 2) return "🟢";
+  if (l <= 4) return "🔵";
+  if (l <= 6) return "🟣";
+  if (l <= 8) return "🟠";
+  if (l == 9) return "🔴";
+  return "⚫️";
+}
+
+float totalKm() { return prefs.getFloat("totalKm", 0); }
+
+// „yeaz0 🔵4 · Golf 1.2 TSI“ (řádek v tabulce)
+String jmenoKratke(float km) {
+  int l = levelFor(km);
+  String s = cfg.name + " " + levelIcon(l) + String(l);
+  if (cfg.car.length()) s += " · " + cfg.car;
+  return s;
+}
+
+// ---------------------- ukládání ----------------------
+void saveTrip()  { prefs.putBytes("trip", &trip, sizeof(Trip)); }
+void saveRec()   { prefs.putBytes("rec", &rec, sizeof(Records)); }
+void saveQueue() {
+  if (qCount) prefs.putBytes("queue", queue, qCount * sizeof(Trip));
+  else prefs.remove("queue");
+}
+
+void loadAll() {
+  if (prefs.getBytesLength("trip") == sizeof(Trip)) prefs.getBytes("trip", &trip, sizeof(Trip));
+  else memset(&trip, 0, sizeof(Trip));
+
+  if (prefs.getBytesLength("rec") == sizeof(Records)) prefs.getBytes("rec", &rec, sizeof(Records));
+  else memset(&rec, 0, sizeof(Records));
+
+  size_t qs = prefs.getBytesLength("queue");
+  if (qs && qs % sizeof(Trip) == 0 && qs / sizeof(Trip) <= MAX_QUEUE) {
+    qCount = qs / sizeof(Trip);
+    prefs.getBytes("queue", queue, qs);
+  } else qCount = 0;
+}
+
+// ---------------------- jízdy ----------------------
+void startTrip() {
+  memset(&trip, 0, sizeof(Trip));
+  trip.open = 1;
+  trip.maxCoolant = -100;
+  saveTrip();
+}
+
+void finishTrip() {
+  if (!trip.open) return;
+  trip.open = 0;
+  if (trip.distKm >= MIN_TRIP_KM) {
+    float celkem = totalKm() + trip.distKm;
+    prefs.putFloat("totalKm", celkem);
+    trip.totalKm = celkem;
+
+    trip.recFlags = 0;
+    if (trip.best050 && (!rec.best050 || trip.best050 < rec.best050)) {
+      trip.prev050 = rec.best050; rec.best050 = trip.best050; trip.recFlags |= 1;
+    }
+    if (trip.best0100 && (!rec.best0100 || trip.best0100 < rec.best0100)) {
+      trip.prev0100 = rec.best0100; rec.best0100 = trip.best0100; trip.recFlags |= 2;
+    }
+    if (trip.maxSpeed > rec.maxSpeed) {
+      trip.prevMaxSpeed = rec.maxSpeed; rec.maxSpeed = trip.maxSpeed; trip.recFlags |= 4;
+    }
+    saveRec();
+    if (qCount == MAX_QUEUE) { memmove(queue, queue + 1, sizeof(Trip) * (MAX_QUEUE - 1)); qCount--; }
+    queue[qCount++] = trip;
+    saveQueue();
+  }
+  saveTrip();
+}
+
+// ---------------------- formátování ----------------------
+String comma(String s) { s.replace(".", ","); return s; }
+String fmtKm(float km)    { return comma(String(km, 1)); }
+String fmtS(uint32_t ms)  { return comma(String(ms / 1000.0f, 1)) + " s"; }
+String fmtV(uint16_t mv)  { return comma(String(mv / 1000.0f, 1)) + " V"; }
+String fmtDur(uint32_t s) {
+  if (s < 60) return String(s) + " s";
+  uint32_t h = s / 3600, m = (s % 3600) / 60;
+  return h ? String(h) + " h " + String(m) + " min" : String(m) + " min";
+}
+
+String fmtRpm(uint16_t r) {                       // 3677 -> "3 677"
+  if (r < 1000) return String(r);
+  String z = String(1000 + r % 1000);
+  return String(r / 1000) + " " + z.substring(1);
+}
+
+// zpráva o jízdě: hlavička + tabulka písmem s pevnou šířkou (Telegram HTML <pre>)
+// stav auta se ukáže jen tehdy, když je něco špatně
+String tripMsg(const Trip& t) {
+  String m = String(levelIcon(levelFor(t.totalKm))) + " " + htmlEsc(cfg.name);
+  if (cfg.car.length()) m += " · " + htmlEsc(cfg.car);
+  m += "\n<pre>┌──────────────────────┐\n";
+  m += "  km       " + fmtKm(t.distKm) + "\n";
+  m += "  čas      " + fmtDur(t.movingMs / 1000) + "\n";
+  m += "  0–50     " + (t.best050 ? fmtS(t.best050) : String("–"));
+  if (t.recFlags & 1) m += "  ★";
+  m += "\n  0–100    " + (t.best0100 ? fmtS(t.best0100) : String("–"));
+  if (t.recFlags & 2) m += "  ★";
+  m += "\n  max      " + String(t.maxSpeed) + " km/h";
+  if ((t.recFlags & 4) && t.prevMaxSpeed) m += "  ★";
+  m += "\n  otáčky   " + fmtRpm(t.maxRpm) + "\n";
+  m += "└──────────────────────┘</pre>";
+
+  // stav auta – jen problémy
+  if (!t.obdOk) return m + "\n⚠️ auto neodpovídalo – žádná data z OBD";
+  if (t.maxCoolant >= 110) m += "\n⚠️ teplota motoru " + String(t.maxCoolant) + " °C";
+  if (t.battLast && t.battLast < 12000) m += "\n⚠️ baterie " + fmtV(t.battLast);
+  if (t.mil) m += "\n⚠️ svítí kontrolka motoru (chyb: " + String(t.dtc) + ")";
+  else if (t.dtc) m += "\n⚠️ uložené chyby motoru: " + String(t.dtc);
+  return m;
+}
+
+// ---------------------- OLED displej ----------------------
+// displej umí jen ASCII (bez háčků a čárek) – ostatní znaky se vynechají
+String ascii(const String& s) {
+  String o;
+  for (size_t i = 0; i < s.length(); i++) {
+    uint8_t c = (uint8_t)s[i];
+    if (c < 128) o += (char)c;
+  }
+  return o;
+}
+
+// řádek r (0–7), písmo 6x8, 21 znaků na řádek
+void radek(int r, const String& s) {
+  String a = ascii(s);
+  if (a.length() > 21) a = a.substring(0, 21);
+  oled.setCursor(0, r * 8);
+  oled.print(a);
+}
+
+void oledInit() {
+  Wire.begin(OLED_SDA, OLED_SCL);
+  oledOk = oled.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR);
+  if (oledOk) {
+    Wire.setClock(400000);
+    oled.clearDisplay();
+    oled.display();
+    Serial.println("OLED: ok");
+  } else {
+    Serial.println("OLED nenalezen – zkontroluj piny (SDA 5, SCL 4) a adresu 0x3C/0x3D");
+  }
+}
+
+// obrazovka v režimu nastavení (pokyny pro mobil)
+void drawPortal() {
+  if (!oledOk) return;
+  oled.clearDisplay();
+  oled.setTextSize(1);
+  oled.setTextColor(SSD1306_WHITE);
+  radek(0, "NASTAVENI");
+  radek(1, "1. Wi-Fi v mobilu:");
+  radek(2, AP_NAME);
+  radek(3, "2. Otevri 192.168.4.1");
+  radek(4, "3. Vypln a uloz");
+  radek(6, "Po ulozeni se restartuje");
+  oled.display();
+}
+
+// úvodní animace: „Ahoj“ a jméno se píše po písmenech, pak lišta načítání (~3,5 s)
+void introAnim() {
+  if (!oledOk) { delay(3500); return; }
+  String jm = ascii(cfg.name.length() ? cfg.name : String("OBD"));
+  oled.setTextColor(SSD1306_WHITE);
+  for (unsigned i = 0; i <= jm.length(); i++) {
+    oled.clearDisplay();
+    oled.setTextSize(2);
+    oled.setCursor(0, 4);
+    oled.print("Ahoj");
+    oled.setCursor(0, 30);
+    oled.print(jm.substring(0, i));
+    oled.display();
+    delay(250);
+  }
+  delay(400);
+  for (int p = 0; p <= 100; p += 4) {
+    oled.clearDisplay();
+    oled.setTextSize(1);
+    oled.setCursor(0, 8);
+    oled.print("Startuji...");
+    oled.drawRect(0, 40, 128, 10, SSD1306_WHITE);
+    oled.fillRect(2, 42, (124 * p) / 100, 6, SSD1306_WHITE);
+    oled.display();
+    delay(40);
+  }
+  delay(300);
+}
+
+// obrazovka kontroly: před jízdou, při stání, při odesílání doma
+void drawCheck() {
+  String verdikt;
+  if (faze == 1)                 verdikt = "Odesilam jizdy";
+  else if (faze == 2)            verdikt = "Hotovo, muzes vypnout";
+  else if (faze == 4)            verdikt = "Nejde odeslat";
+  else if (!btConnected)         verdikt = "Cekam na OBD";
+  else if (trip.battLast && trip.battLast < 12000) verdikt = "Slaba baterie!";
+  else                           verdikt = "Muzes vyjet";
+
+  radek(0, "STAV v" + String(FW_VERSION));
+  radek(1, btConnected ? String("OBD: spojeno") : String("OBD: hledam..."));
+  radek(2, "Baterie: " + (trip.battLast ? fmtV(trip.battLast) : String("--")));
+  radek(3, "Wi-Fi: " + String(WiFi.status() == WL_CONNECTED ? "ANO" : "vypnuta"));
+  radek(4, "Cekaji jizdy: " + String(qCount));
+  radek(5, verdikt);
+  radek(6, "Ujeto: " + fmtKm(trip.distKm) + " km");
+}
+
+// výstraha přes celou obrazovku (bílé pozadí, černý text)
+void drawAlert(const String& h1, const String& h2) {
+  oled.fillScreen(SSD1306_WHITE);
+  oled.setTextColor(SSD1306_BLACK);
+  oled.setTextSize(2);
+  oled.setCursor(20, 4);
+  oled.print("POZOR!");
+  oled.setTextSize(1);
+  oled.setCursor(4, 34);
+  oled.print(ascii(h1).substring(0, 21));
+  oled.setCursor(4, 46);
+  oled.print(ascii(h2).substring(0, 21));
+  oled.setTextColor(SSD1306_WHITE);
+}
+
+// vrátí true, když je třeba varovat (teplota nebo nabíjení při běžícím motoru)
+bool alarmAktivni(String& a, String& b) {
+  if (liveCool > VAROVANI_COOL_C) {
+    a = "Chladici " + String(liveCool) + " C";
+    b = "Prehrivani motoru!";
+    return true;
+  }
+  if (liveRpm > 800 && trip.battLast && trip.battLast < VAROVANI_BAT_MV) {
+    a = "Baterie " + fmtV(trip.battLast);
+    b = "Nenabiji alternator";
+    return true;
+  }
+  return false;
+}
+
+// jízdní obrazovky podle tlačítka (stranka 0, 1, 2)
+void drawDrive(uint32_t now) {
+  String t050, t0100;
+  if (runActive) {
+    t050  = run050  ? fmtS(run050)  : fmtS(now - runStart) + "...";
+    t0100 = run0100 ? fmtS(run0100) : fmtS(now - runStart) + "...";
+  } else {
+    t050  = run050  ? fmtS(run050)  : String("--");
+    t0100 = run0100 ? fmtS(run0100) : String("--");
+  }
+
+  if (stranka == 0) {                       // zrychlení
+    radek(0, "ZRYCHLENI");
+    radek(2, "JIZDA " + fmtKm(trip.distKm) + " km");
+    radek(3, "0-50:  " + t050);
+    radek(4, "0-100: " + t0100);
+    radek(5, "Max: " + String(trip.maxSpeed) + " km/h");
+  } else if (stranka == 1) {                // turbo a motor
+    float plnici = (liveMap - 100) / 100.0f;      // bar nad atmosférou
+    String zn = plnici >= 0 ? "+" : "";
+    radek(0, "TURBO A MOTOR");
+    radek(2, "Plnici: " + zn + comma(String(plnici, 2)) + " bar");
+    radek(3, "Zatizeni: " + String(liveLoad) + " %");
+    radek(4, "Sani: " + String(liveIat) + " C");
+    radek(5, "Otacky: " + String(liveRpm));
+  } else {                                  // chlazení a baterie
+    String alt;
+    if (liveRpm > 800)
+      alt = trip.battLast >= 13800 ? "Alternator: dobija OK" : "Alternator: NEdobija";
+    else
+      alt = "Motor nebezi";
+    radek(0, "CHLAZENI A BATERIE");
+    radek(2, "Chladici: " + String(liveCool) + " C");
+    radek(3, "Max chladici: " + String(trip.maxCoolant) + " C");
+    radek(4, "Baterie: " + (trip.battLast ? fmtV(trip.battLast) : String("--")));
+    radek(5, alt);
+    radek(6, "Cekaji jizdy: " + String(qCount));
+    radek(7, WiFi.status() == WL_CONNECTED ? String("Wi-Fi: ANO") : String("Wi-Fi: vypnuta"));
+  }
+}
+
+// vykreslí celý displej (volá se každých ~200 ms)
+void drawOled() {
+  if (!oledOk) return;
+  uint32_t now = millis();
+  bool jede = prevSpeed > 0 || (lastMoveMs && now - lastMoveMs < STOJI_MS);
+
+  oled.clearDisplay();
+  oled.setTextSize(1);
+  oled.setTextColor(SSD1306_WHITE);
+  String a, b;
+  if (faze == 1 || faze == 2 || faze == 4 || !btConnected || !jede) drawCheck();
+  else if (alarmAktivni(a, b)) drawAlert(a, b);      // výstraha přebije stránku
+  else drawDrive(now);
+  oled.display();
+}
+
+// ---------------------- nastavení z mobilu ----------------------
+String htmlEsc(String s) {
+  s.replace("&", "&amp;");
+  s.replace("<", "&lt;");
+  s.replace(">", "&gt;");
+  s.replace("\"", "&quot;");
+  return s;
+}
+
+// očistí text z formuláře a zkrátí ho (bez rozbití znaků s diakritikou)
+String cleanField(String s, int maxLen) {
+  s.replace("\r", " ");
+  s.replace("\n", " ");
+  s.replace(" – ", " - ");                         // pomlčka by rozbila tabulku
+  s.trim();
+  if ((int)s.length() > maxLen) {
+    int n = maxLen;
+    while (n > 0 && ((uint8_t)s[n] & 0xC0) == 0x80) n--;
+    s = s.substring(0, n);
+    s.trim();
+  }
+  return s;
+}
+
+String pole(const char* popis, const char* jmeno, const String& hodnota, const char* typ,
+            const char* napoveda, const char* navic) {
+  String h = "<label>" + String(popis) + "</label><input name='" + jmeno + "' type='" + typ +
+             "' value=\"" + htmlEsc(hodnota) + "\" placeholder=\"" + napoveda + "\" " + navic + ">";
+  return h;
+}
+
+void handleRoot() {
+  portalActivity = millis();
+  float km = totalKm();
+  int l = levelFor(km);
+  String h =
+    "<!doctype html><html><head><meta charset='utf-8'>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>OBD nastavení</title><style>"
+    "body{font-family:-apple-system,Segoe UI,sans-serif;background:#111;color:#eee;margin:0;padding:16px}"
+    "main{max-width:460px;margin:auto}h1{font-size:22px;margin:4px 0 2px}"
+    ".info{color:#999;font-size:14px;margin-bottom:8px}"
+    ".diag{background:#1b1b1b;border:1px solid #333;border-radius:10px;padding:10px 12px;font-size:14px;line-height:1.6}"
+    "label{display:block;margin:14px 0 4px;color:#aaa;font-size:14px}"
+    "input{width:100%;box-sizing:border-box;padding:12px;font-size:17px;border-radius:10px;"
+    "border:1px solid #444;background:#222;color:#fff}"
+    "button{margin-top:24px;width:100%;padding:14px;font-size:18px;border:0;border-radius:12px;"
+    "background:#2a7de1;color:#fff}details{margin-top:22px;color:#aaa}summary{font-size:15px}"
+    "</style></head><body><main><h1>🚗 OBD nastavení</h1>";
+  h += "<div class='info'>Verze " + String(FW_VERSION) + " · najeto " + fmtKm(km) + " km · " +
+       levelIcon(l) + " Lvl " + String(l) + "</div>";
+  h += diagHtml();
+  h += "<form method='post' action='/save'>";
+  h += pole("Přezdívka (uvidí ji ostatní)", "name", cfg.name, "text", "např. yeaz0", "maxlength=20 required");
+  h += pole("Auto", "car", cfg.car, "text", "např. Fabia III 2017", "maxlength=24");
+  h += pole("Domácí Wi-Fi (název)", "ssid", cfg.ssid, "text", "vyber nebo napiš", "list='wl' required");
+  h += "<datalist id='wl'>" + wifiOptions + "</datalist>";
+  h += pole("Heslo k domácí Wi-Fi", "pass", cfg.pass, "text", "", "");
+  h += pole("Token bota", "token", "", "text",
+            cfg.token.length() ? "uloženo – nech prázdné" : "dostaneš od správce", "autocomplete='off'");
+  h += "<details><summary>Pokročilé</summary>";
+  h += pole("ID skupiny", "chat", cfg.chat, "text", "", "");
+  h += pole("Jméno OBD adaptéru (Bluetooth)", "elm", cfg.elm, "text", "OBDII", "");
+  h += pole("PIN OBD adaptéru", "pin", cfg.pin, "text", "1234", "");
+  h += pole("MAC adresa OBD adaptéru", "mac", cfg.mac, "text", "zjistí se samo", "autocomplete='off'");
+  h += "</details><button type='submit'>Uložit</button></form></main></body></html>";
+  web.send(200, "text/html; charset=utf-8", h);
+}
+
+void handleSave() {
+  portalActivity = millis();
+  String name = cleanField(web.arg("name"), 20);
+  String car  = cleanField(web.arg("car"), 24);
+  String ssid = web.arg("ssid");  ssid.trim();
+  String pass = web.arg("pass"); pass.trim();
+  String tok  = web.arg("token"); tok.trim();
+  String chat = web.arg("chat");  chat.trim();
+  String elm  = web.arg("elm");   elm.trim();
+  String pin  = web.arg("pin");   pin.trim();
+  String mac  = web.arg("mac");   mac.trim(); mac.toUpperCase();
+
+  if (!name.length() || !ssid.length() || (!tok.length() && !cfg.token.length())) {
+    web.send(200, "text/html; charset=utf-8",
+             "<meta charset='utf-8'><meta name='viewport' content='width=device-width'>"
+             "<body style='font-family:sans-serif;background:#111;color:#eee;padding:20px'>"
+             "<h2>⚠️ Chybí přezdívka, Wi-Fi nebo token</h2><a style='color:#6af' href='/'>Zpět</a></body>");
+    return;
+  }
+
+  saveCfgKey("name", name);
+  saveCfgKey("car", car);
+  saveCfgKey("ssid", ssid);
+  saveCfgKey("pass", pass);
+  if (tok.length()) saveCfgKey("token", tok);
+  saveCfgKey("chat", chat.length() ? chat : String(DEFAULT_CHAT));
+  saveCfgKey("elm", elm.length() ? elm : String("OBDII"));
+  saveCfgKey("pin", pin.length() ? pin : String("1234"));
+  saveCfgKey("mac", mac);
+
+  web.send(200, "text/html; charset=utf-8",
+           "<meta charset='utf-8'><meta name='viewport' content='width=device-width'>"
+           "<body style='font-family:sans-serif;background:#111;color:#eee;padding:20px'>"
+           "<h2>✅ Uloženo</h2><p>ESP se restartuje a začne normálně fungovat. "
+           "Stránku můžeš zavřít.</p></body>");
+  delay(1500);
+  ESP.restart();
+}
+
+void runPortal() {
+  Serial.println("Rezim nastaveni");
+  obdLed = 3;
+  drawPortal();
+
+  // seznam okolních Wi-Fi pro nabídku
+  WiFi.mode(WIFI_STA);
+  int n = WiFi.scanNetworks();
+  wifiOptions = "";
+  for (int i = 0; i < n; i++) {
+    String s = WiFi.SSID(i);
+    if (s.length() && wifiOptions.indexOf("\"" + htmlEsc(s) + "\"") < 0)
+      wifiOptions += "<option value=\"" + htmlEsc(s) + "\">";
+  }
+  WiFi.scanDelete();
+
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_NAME);
+  delay(300);
+  dns.start(53, "*", WiFi.softAPIP());
+  web.on("/", handleRoot);
+  web.on("/save", HTTP_POST, handleSave);
+  web.onNotFound(handleRoot);                       // mobil to pak otevře samo
+  web.begin();
+
+  portalActivity = millis();
+  uint32_t start = millis();
+  uint32_t lastDraw = millis();
+  for (;;) {
+    dns.processNextRequest();
+    web.handleClient();
+    if (millis() - lastDraw > 500) {                // pokyny na displeji
+      lastDraw = millis();
+      drawPortal();
+    }
+    if (configured()) {
+      // nikdo se nepřipojil do 1 min, nebo 10 min bez aktivity -> zpět k normálu
+      if (WiFi.softAPgetStationNum() == 0 && millis() - start > 60000) ESP.restart();
+      if (millis() - portalActivity > 600000) ESP.restart();
+    }
+    delay(2);
+  }
+}
+
+// ---------------------- WiFi / Telegram ----------------------
+// hledá domácí Wi-Fi a zapamatuje si nejsilnější vysílač (kanál, adresu, sílu signálu)
+bool homeVisible() {
+  WiFi.mode(WIFI_STA);
+  int n = WiFi.scanNetworks(false, false, false, 150);
+  bool found = false;
+  for (int i = 0; i < n; i++) {
+    if (WiFi.SSID(i) != cfg.ssid) continue;
+    if (!found || WiFi.RSSI(i) > homeRssi) {
+      homeRssi = WiFi.RSSI(i);
+      homeCh = WiFi.channel(i);
+      memcpy(homeBssid, WiFi.BSSID(i), 6);
+    }
+    found = true;
+  }
+  WiFi.scanDelete();
+  return found;
+}
+
+void onWifiOdpojeno(WiFiEvent_t e, WiFiEventInfo_t info) {
+  wifiDuvod = info.wifi_sta_disconnected.reason;
+}
+
+// připojení k domácí Wi-Fi: až 3 pokusy po 15 s
+bool wifiConnect() {
+  static bool udalost = false;
+  if (!udalost) {
+    WiFi.onEvent(onWifiOdpojeno, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
+    udalost = true;
+  }
+  if (homeRssi && prefs.getChar("rssi", 0) != homeRssi) prefs.putChar("rssi", homeRssi);
+  for (int pokus = 0; pokus < 3; pokus++) {
+    WiFi.disconnect(true);
+    delay(200);
+    wifiDuvod = 0;
+    WiFi.mode(WIFI_STA);
+    if (homeCh && pokus < 2) WiFi.begin(cfg.ssid.c_str(), cfg.pass.c_str(), homeCh, homeBssid);
+    else WiFi.begin(cfg.ssid.c_str(), cfg.pass.c_str());   // poslední pokus bez určení vysílače
+    uint32_t t = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - t < 15000) delay(100);
+    if (WiFi.status() == WL_CONNECTED) return true;
+    Serial.printf("WiFi pokus %d nevysel, duvod %d\n", pokus + 1, wifiDuvod);
+    if (wifiDuvod == 202) break;                    // jistě špatné heslo -> nemá smysl zkoušet dál
+  }
+  if (prefs.getUChar("wifiDuv", 0) != wifiDuvod) prefs.putUChar("wifiDuv", wifiDuvod);
+  return false;
+}
+
+uint32_t syncTime() {
+  configTzTime("CET-1CEST,M3.5.0,M10.5.0/3", "pool.ntp.org", "time.google.com");
+  struct tm tmv;
+  if (getLocalTime(&tmv, 5000)) return (uint32_t)time(nullptr);
+  return 0;
+}
+
+String urlencode(const String& s) {
+  String o; char b[4];
+  for (size_t i = 0; i < s.length(); i++) {
+    uint8_t c = (uint8_t)s[i];
+    if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') o += (char)c;
+    else { snprintf(b, sizeof(b), "%%%02X", c); o += b; }
+  }
+  return o;
+}
+
+int tgPostRaw(const char* method, const String& body, String& out) {
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setTimeout(10000);
+  if (!http.begin(client, "https://api.telegram.org/bot" + cfg.token + "/" + method)) return -1;
+  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+  int code = http.POST(body);
+  out = http.getString();
+  Serial.printf("Telegram %s: %d\n", method, code);
+  http.end();
+  if (strcmp(method, "sendMessage") == 0) {           // výsledek pro stránku nastavení
+    String st = "OK";
+    if (code != 200) {
+      int p = out.indexOf("\"description\":\"");
+      st = "chyba " + String(code) + (p >= 0 ? ": " + jsonStr(out, p + 15) : String(""));
+    }
+    if (prefs.getString("tgSt", "") != st) prefs.putString("tgSt", st);
+  }
+  return code;
+}
+
+// volání Telegram API; při převodu skupiny na supergroup si samo uloží nové ID
+int tgPost(const char* method, const String& body, String* resp) {
+  String out;
+  int code = tgPostRaw(method, body, out);
+  int mp = out.indexOf("\"migrate_to_chat_id\":");
+  if (code == 400 && mp >= 0) {
+    int z = mp + strlen("\"migrate_to_chat_id\":"), k = z;
+    while (k < (int)out.length() && (out[k] == '-' || isdigit((unsigned char)out[k]))) k++;
+    String noveId = out.substring(z, k);
+    if (noveId.length() > 3) {
+      String stare = chatId;
+      chatId = noveId;
+      saveCfgKey("chat", chatId);
+      String body2 = body;
+      body2.replace("chat_id=" + stare, "chat_id=" + chatId);
+      code = tgPostRaw(method, body2, out);
+    }
+  }
+  if (code == 200 && strcmp(method, "sendMessage") == 0) {   // záložní čas
+    int dp = out.indexOf("\"date\":");
+    if (dp >= 0) {
+      long d = out.substring(dp + 7).toInt();
+      if (d > 1600000000L) tgDate = d;
+    }
+  }
+  if (resp) *resp = out;
+  return code;
+}
+
+bool tgSend(const String& text) {
+  return tgPost("sendMessage", "chat_id=" + chatId + "&text=" + urlencode(text), nullptr) == 200;
+}
+
+// zpráva s formátováním (HTML – kvůli tabulce s pevnou šířkou písma)
+bool tgSendHtml(const String& text) {
+  return tgPost("sendMessage", "chat_id=" + chatId + "&parse_mode=HTML&text=" + urlencode(text), nullptr) == 200;
+}
+
+// ---------------------- JSON pomůcky ----------------------
+void appendUtf8(String& o, uint32_t cp) {
+  if (cp < 0x80) o += (char)cp;
+  else if (cp < 0x800) { o += (char)(0xC0 | (cp >> 6)); o += (char)(0x80 | (cp & 0x3F)); }
+  else if (cp < 0x10000) { o += (char)(0xE0 | (cp >> 12)); o += (char)(0x80 | ((cp >> 6) & 0x3F)); o += (char)(0x80 | (cp & 0x3F)); }
+  else { o += (char)(0xF0 | (cp >> 18)); o += (char)(0x80 | ((cp >> 12) & 0x3F)); o += (char)(0x80 | ((cp >> 6) & 0x3F)); o += (char)(0x80 | (cp & 0x3F)); }
+}
+
+// přečte JSON řetězec od pozice hned za otevírací uvozovkou (umí \n, \", \uXXXX i emoji)
+String jsonStr(const String& js, int i) {
+  String o;
+  for (; i < (int)js.length(); i++) {
+    char c = js[i];
+    if (c == '"') break;
+    if (c != '\\') { o += c; continue; }
+    char e = js[++i];
+    if (e == 'n') o += '\n';
+    else if (e == 'u') {
+      uint32_t cp = strtoul(js.substring(i + 1, i + 5).c_str(), nullptr, 16);
+      i += 4;
+      if (cp >= 0xD800 && cp <= 0xDBFF && js[i + 1] == '\\' && js[i + 2] == 'u') {
+        uint32_t lo = strtoul(js.substring(i + 3, i + 7).c_str(), nullptr, 16);
+        cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+        i += 6;
+      }
+      appendUtf8(o, cp);
+    } else o += e;
+  }
+  return o;
+}
+
+long jsonNum(const String& js, const char* key, int from) {
+  int p = js.indexOf(key, from);
+  if (p < 0) return 0;
+  return js.substring(p + strlen(key)).toInt();
+}
+
+// ---------------------- týdenní tabulka ----------------------
+const char* POMLCKA = " – ";
+const char* TAB_ZACATEK = "🏆 Týden";
+
+// 0 = 0–100, 1 = 0–50, 2 = najeto km (střídá se po týdnech)
+int disciplina(uint32_t epoch) {
+  time_t t = epoch; struct tm tmv;
+  localtime_r(&t, &tmv);
+  tmv.tm_mday -= (tmv.tm_wday + 6) % 7;           // pondělí tohoto týdne
+  tmv.tm_hour = 12; tmv.tm_min = 0; tmv.tm_sec = 0; tmv.tm_isdst = -1;
+  time_t po = mktime(&tmv);
+  long tyden = ((long)(po / 86400) + 3) / 7;
+  return (int)((tyden + 2) % 3);
+}
+
+const char* discNazev(int d) {
+  if (d == 0) return "🏁 0–100";
+  if (d == 1) return "🏁 0–50";
+  return "📏 Najeto";
+}
+
+String fmtVal(int d, float v) { return comma(String(v, 1)) + (d < 2 ? " s" : " km"); }
+bool lepsi(int d, float a, float b) { return d < 2 ? a < b : a > b; }
+
+// „🏆 Týden 26. 10. – 1. 11.“ + další řádek s disciplínou
+String tabHlavicka(uint32_t epoch) {
+  time_t t = epoch; struct tm tmv;
+  localtime_r(&t, &tmv);
+  int odPondeli = (tmv.tm_wday + 6) % 7;
+  time_t po = t - odPondeli * 86400L, ne = po + 6 * 86400L;
+  struct tm a, b;
+  localtime_r(&po, &a);
+  localtime_r(&ne, &b);
+  return String(TAB_ZACATEK) + " " + String(a.tm_mday) + ". " + String(a.tm_mon + 1) + ". – " +
+         String(b.tm_mday) + ". " + String(b.tm_mon + 1) + ".\n" + discNazev(disciplina(epoch));
+}
+
+float numFrom(String s) { s.replace(",", "."); s.trim(); return s.toFloat(); }
+
+bool jeMedaile(const String& l) {
+  return l.startsWith("🥇") || l.startsWith("🥈") || l.startsWith("🥉") ||
+         (l.length() && isdigit((unsigned char)l[0]));
+}
+
+// rozebere řádky tabulky („🥇 jméno 🔵4 · auto – 9,8 s“)
+void lbParse(const String& text) {
+  lbN = 0;
+  int start = 0;
+  while (start < (int)text.length() && lbN < LB_MAX) {
+    int end = text.indexOf('\n', start);
+    if (end < 0) end = text.length();
+    String l = text.substring(start, end);
+    start = end + 1;
+    if (!jeMedaile(l)) continue;
+    int sp = l.indexOf(' ');
+    int d = l.lastIndexOf(POMLCKA);
+    if (sp < 0 || d < 0 || sp >= d) continue;
+    lb[lbN].label = l.substring(sp + 1, d);
+    lb[lbN].val = numFrom(l.substring(d + strlen(POMLCKA)));
+    if (lb[lbN].val > 0) lbN++;
+  }
+}
+
+bool mujRadek(const String& label) {
+  const char* ikony[] = { "🟢", "🔵", "🟣", "🟠", "🔴", "⚫" };
+  for (const char* ik : ikony) if (label.startsWith(cfg.name + " " + ik)) return true;
+  return false;
+}
+
+String medaile(int i) {
+  if (i == 0) return "🥇";
+  if (i == 1) return "🥈";
+  if (i == 2) return "🥉";
+  return String(i + 1) + ".";
+}
+
+String lbBuild(const String& hlavicka, int d) {
+  int idx[LB_MAX];
+  for (int i = 0; i < lbN; i++) idx[i] = i;
+  for (int a = 0; a < lbN; a++) for (int b = a + 1; b < lbN; b++)
+    if (lepsi(d, lb[idx[b]].val, lb[idx[a]].val)) { int t = idx[a]; idx[a] = idx[b]; idx[b] = t; }
+  String m = hlavicka + "\n\n";
+  for (int i = 0; i < lbN; i++)
+    m += medaile(i) + " " + lb[idx[i]].label + POMLCKA + fmtVal(d, lb[idx[i]].val) + "\n";
+  return m;
+}
+
+void nactiPripnutou(long& id, String& text) {
+  id = 0;
+  text = "";
+  String r;
+  if (tgPost("getChat", "chat_id=" + chatId, &r) != 200) return;
+  int p = r.indexOf("\"pinned_message\":{");
+  if (p < 0) return;
+  id = jsonNum(r, "\"message_id\":", p);
+  int t = r.indexOf("\"text\":\"", p);
+  if (t >= 0) text = jsonStr(r, t + 8);
+}
+
+bool pripni(long id, String& chyba) {
+  String r;
+  int code = tgPost("pinChatMessage", "chat_id=" + chatId + "&message_id=" + String(id) +
+                    "&disable_notification=true", &r);
+  if (code == 200) {
+    prefs.putUChar("pinWarn", 0);
+    return true;
+  }
+  int p = r.indexOf("\"description\":\"");
+  chyba = p >= 0 ? jsonStr(r, p + 15) : String("kód ") + String(code);
+  return false;
+}
+
+void varovaniPripnuti(const String& chyba) {
+  if (prefs.getUChar("pinWarn", 0)) return;
+  tgSend("⚠️ Tabulku se nepodařilo připnout (" + chyba + ").\n"
+         "Dej botovi ve skupině práva správce se zapnutým „Připínat zprávy“.");
+  prefs.putUChar("pinWarn", 1);
+}
+
+// najde aktuální tabulku: připnutou, nebo tu, kterou jsem poslal minule
+void najdiTabulku(long& id, String& text) {
+  nactiPripnutou(id, text);
+  if (text.startsWith(TAB_ZACATEK)) return;
+  long mojeId = prefs.getLong("lbId", 0);
+  String mujText = prefs.getString("lbTxt", "");
+  if (!mojeId || !mujText.startsWith(TAB_ZACATEK)) return;
+  String chyba;
+  if (pripni(mojeId, chyba)) nactiPripnutou(id, text);
+  else if (chyba.indexOf("not found") >= 0) {      // tabulku někdo smazal -> pošle se nová
+    prefs.remove("lbId");
+    prefs.remove("lbTxt");
+    return;
+  }
+  else varovaniPripnuti(chyba);
+  if (!text.startsWith(TAB_ZACATEK)) { id = mojeId; text = mujText; }
+}
+
+// doplní moje číslo do připnuté tabulky (jen disciplína tohoto týdne)
+void updateLeaderboard(uint32_t nowEpoch, float t100, float t50, float km) {
+  int d = disciplina(nowEpoch);
+  float moje = d == 0 ? t100 : (d == 1 ? t50 : km);
+  if (moje <= 0) return;                            // tento týden nemám co zapsat
+
+  String hlav = tabHlavicka(nowEpoch);
+  String mujLabel = jmenoKratke(totalKm());
+  delay(random(0, 4000));                           // ať se víc ESP nepotká ve stejnou chvíli
+
+  for (int pokus = 0; pokus < 3; pokus++) {
+    long id; String text;
+    najdiTabulku(id, text);
+
+    lbN = 0;
+    if (text.startsWith(hlav)) lbParse(text);       // stejný týden -> navázat; jinak od nuly
+
+    int k = -1;
+    for (int i = 0; i < lbN; i++) if (mujRadek(lb[i].label)) { k = i; break; }
+    float nova = moje;
+    if (k >= 0) {
+      if (d == 2) nova = lb[k].val + moje;
+      else if (!lepsi(d, moje, lb[k].val)) nova = lb[k].val;
+    } else if (lbN < LB_MAX) {
+      k = lbN++;
+    } else {                                        // plno: nahradit nejhoršího, když jsem lepší
+      int nej = 0;
+      for (int i = 1; i < lbN; i++) if (lepsi(d, lb[nej].val, lb[i].val)) nej = i;
+      if (!lepsi(d, moje, lb[nej].val)) return;
+      k = nej;
+    }
+    lb[k].label = mujLabel;
+    lb[k].val = nova;
+    String novyText = lbBuild(hlav, d);
+    String mujRadekText = mujLabel + POMLCKA + fmtVal(d, nova);
+
+    String r;
+    if (id && text.startsWith(TAB_ZACATEK)) {
+      int code = tgPost("editMessageText", "chat_id=" + chatId + "&message_id=" + String(id) +
+                        "&text=" + urlencode(novyText), &r);
+      if (code == 200 || r.indexOf("not modified") >= 0) {
+        prefs.putLong("lbId", id);
+        prefs.putString("lbTxt", novyText);
+        // kontrola, jestli mě mezitím nepřepsal někdo jiný
+        delay(1500);
+        long id2; String text2;
+        nactiPripnutou(id2, text2);
+        if (!text2.startsWith(TAB_ZACATEK) || text2.indexOf(mujRadekText) >= 0) return;
+        Serial.println("Tabulku mezitim prepsal nekdo jiny, znovu");
+        continue;
+      }
+    }
+
+    // tabulka neexistuje -> poslat potichu a připnout
+    if (tgPost("sendMessage", "chat_id=" + chatId + "&text=" + urlencode(novyText) +
+               "&disable_notification=true", &r) != 200) return;
+    long noveId = jsonNum(r, "\"message_id\":", 0);
+    if (!noveId) return;
+    prefs.putLong("lbId", noveId);
+    prefs.putString("lbTxt", novyText);
+    String chyba;
+    if (!pripni(noveId, chyba)) varovaniPripnuti(chyba);
+    return;
+  }
+}
+
+// ---------------------- aktualizace z GitHubu ----------------------
+void checkOta() {
+  WiFiClientSecure c;
+  c.setInsecure();
+  HTTPClient http;
+  http.setTimeout(8000);
+  if (!http.begin(c, String(OTA_URL) + "version.txt?t=" + String(millis()))) return;
+  int code = http.GET();
+  String v = code == 200 ? http.getString() : String("");
+  http.end();
+  v.trim();
+  int nova = v.toInt();
+  Serial.printf("Verze: mam %d, na GitHubu %d\n", FW_VERSION, nova);
+  if (code != 200 || nova <= FW_VERSION) return;
+
+  WiFiClientSecure c2;
+  c2.setInsecure();
+  httpUpdate.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  httpUpdate.rebootOnUpdate(true);
+  t_httpUpdate_return r = httpUpdate.update(c2, String(OTA_URL) + "firmware.bin");
+  if (r == HTTP_UPDATE_FAILED)
+    Serial.printf("Aktualizace selhala: %s\n", httpUpdate.getLastErrorString().c_str());
+}
+
+// ---------------------- ELM327 ----------------------
+bool elmCmd(const char* cmd, String& out, uint32_t timeout) {
+  while (SerialBT.available()) SerialBT.read();
+  SerialBT.print(cmd);
+  SerialBT.print('\r');
+  out = "";
+  uint32_t t0 = millis();
+  while (millis() - t0 < timeout) {
+    while (SerialBT.available()) {
+      char c = SerialBT.read();
+      if (c == '>') return true;
+      if (c == ' ') continue;
+      if (c == '\r' || c == '\n') {
+        if (out.length() && out[out.length() - 1] != '|') out += '|';
+        continue;
+      }
+      out += (char)toupper(c);
+    }
+    delay(2);
+  }
+  return false;
+}
+
+int hexByte(const String& s, int pos) {
+  if (pos + 2 > (int)s.length()) return -1;
+  char b[3] = { s[pos], s[pos + 1], 0 };
+  char* e;
+  long v = strtol(b, &e, 16);
+  return *e ? -1 : (int)v;
+}
+
+bool queryPid(const char* cmd, const char* hdr, int nbytes, int* outBytes) {
+  String r;
+  if (!elmCmd(cmd, r, 1000)) { errStreak++; return false; }
+  int p = r.indexOf(hdr);
+  if (p < 0) { errStreak++; return false; }       // NO DATA apod.
+  p += strlen(hdr);
+  for (int i = 0; i < nbytes; i++) {
+    int v = hexByte(r, p + 2 * i);
+    if (v < 0) { errStreak++; return false; }
+    outBytes[i] = v;
+  }
+  errStreak = 0;
+  trip.obdOk = 1;
+  return true;
+}
+
+bool elmInit() {
+  String r;
+  elmCmd("ATZ", r, 3000);
+  delay(300);
+  const char* setup[] = { "ATE0", "ATL0", "ATS0", "ATH0", "ATAT1" };
+  for (const char* c : setup) if (!elmCmd(c, r, 1000)) return false;
+
+  elmCmd("ATSP6", r, 1000);                       // většina aut od ~2008 = CAN 11bit 500k
+  if (elmCmd("0100", r, 5000) && r.indexOf("4100") >= 0) return true;
+  elmCmd("ATSP0", r, 1000);                       // záloha: automatika
+  if (elmCmd("0100", r, 10000) && r.indexOf("4100") >= 0) return true;
+  return false;
+}
+
+bool parseMac(const String& s, uint8_t* m) {
+  unsigned int v[6];
+  if (sscanf(s.c_str(), "%x:%x:%x:%x:%x:%x", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) != 6) return false;
+  for (int i = 0; i < 6; i++) {
+    if (v[i] > 255) return false;
+    m[i] = v[i];
+  }
+  return true;
+}
+
+bool btConnect() {
+  obdLed = 1;
+  static uint8_t macFails = 0;
+  uint8_t mac[6];
+  bool ok = false;
+  if (parseMac(cfg.mac, mac) && macFails < 3) {
+    ok = SerialBT.connect(mac);                     // adresa známá -> rychlé a spolehlivé
+    if (ok) macFails = 0; else macFails++;
+  } else {
+    // adresa neznámá nebo nefunguje: najít adaptér podle jména a adresu si zapamatovat
+    BTScanResults* res = SerialBT.discover(10000);
+    if (res) {
+      for (int i = 0; i < res->getCount(); i++) {
+        BTAdvertisedDevice* d = res->getDevice(i);
+        if (d && d->haveName() && String(d->getName().c_str()) == cfg.elm) {
+          String a = String(d->getAddress().toString().c_str());
+          a.toUpperCase();
+          if (parseMac(a, mac)) {
+            ok = SerialBT.connect(mac);
+            if (ok) { cfg.mac = a; saveCfgKey("mac", a); }
+          }
+          break;
+        }
+      }
+    }
+    if (!ok) ok = SerialBT.connect(cfg.elm);        // poslední pokus přímo podle jména
+    macFails = 0;                                   // příště zase zkusit uloženou adresu
+  }
+  Serial.printf("BT pripojeni k %s: %s\n", cfg.elm.c_str(), ok ? "OK" : "selhalo");
+  return ok;
+}
+
+void readVolt() {
+  String r;
+  if (!elmCmd("ATRV", r, 1000)) return;
+  r.replace("|", "");
+  float v = r.toFloat();
+  if (v < 5 || v > 20) return;
+  trip.battLast = (uint16_t)(v * 1000);
+}
+
+// ---------------------- výpočty ----------------------
+uint32_t crossTime(uint32_t t1, int v1, uint32_t t2, int v2, int target) {
+  if (v2 == v1) return t2;
+  return t1 + (uint32_t)((target - v1) * (float)(t2 - t1) / (v2 - v1));
+}
+
+void onSpeed(int v, uint32_t now) {
+  if (prevSpeedMs) {
+    uint32_t dt = now - prevSpeedMs;
+    if (dt < 3000) {
+      trip.distKm += (v + prevSpeed) / 2.0f * dt / 3600000.0f;
+      if (v > 0 || prevSpeed > 0) trip.movingMs += dt;
+    }
+  }
+  if (v > trip.maxSpeed) trip.maxSpeed = v;
+  if (v > 0) lastMoveMs = now;
+
+  if (v == 0) {
+    if (prevSpeed > 0) saveNow = true;              // zastavil -> hned uložit
+    if (prevSpeed > 0 || !zeroSince) zeroSince = now;
+    runActive = false;
+    lastZeroMs = now;
+  } else {
+    zeroSince = 0;
+    if (prevSpeed == 0 && lastZeroMs && now - lastZeroMs < 1500) {
+      runActive = true;
+      got50 = false;
+      runStart = (lastZeroMs + now) / 2;
+      run050 = 0;
+      run0100 = 0;
+    } else if (runActive && prevSpeedMs) {
+      // tolerance poklesu 4 km/h, aby pomalejší vzorkování ELM327 nezrušilo měření
+      if (v < prevSpeed - 4 || now - runStart > 40000) {
+        runActive = false;                          // zpomalil = měření zrušeno
+      } else {
+        if (!got50 && prevSpeed < 50 && v >= 50) {
+          uint32_t t = crossTime(prevSpeedMs, prevSpeed, now, v, 50) - runStart;
+          run050 = t;                               // pro displej
+          if (t > 2000 && (!trip.best050 || t < trip.best050)) trip.best050 = t;
+          got50 = true;
+        }
+        if (prevSpeed < 100 && v >= 100) {
+          uint32_t t = crossTime(prevSpeedMs, prevSpeed, now, v, 100) - runStart;
+          run0100 = t;                              // pro displej
+          if (t > 5000 && (!trip.best0100 || t < trip.best0100)) trip.best0100 = t;
+          runActive = false;
+        }
+      }
+    }
+  }
+  prevSpeed = v;
+  prevSpeedMs = now;
+}
+
+void periodic() {
+  uint32_t now = millis();
+  trip.onSec = onBase + now / 1000;
+
+  // dlouhý stisk tlačítka stránek -> nastavení (stejně jako BOOT)
+  if (portalReq) {
+    saveTrip();
+    prefs.putUChar("portal", 1);
+    ESP.restart();
+  }
+
+  // displej osvěžit každých 200 ms
+  static uint32_t lastDraw = 0;
+  if (now - lastDraw > 200) {
+    lastDraw = now;
+    drawOled();
+  }
+
+  // běží déle než 20 s -> vynulovat počítadlo rychlých zapnutí
+  static bool bootsReset = false;
+  if (!bootsReset && now > 20000) {
+    bootsReset = true;
+    prefs.putUChar("boots", 0);
+  }
+
+  // podržené tlačítko BOOT 2 s -> restart do nastavení
+  static uint32_t btnSince = 0;
+  if (digitalRead(BTN_BOOT) == LOW) {
+    if (!btnSince) btnSince = now ? now : 1;
+    else if (now - btnSince > 2000) {
+      saveTrip();                                   // jízda pokračuje i po nastavení
+      prefs.putUChar("portal", 1);
+      ESP.restart();
+    }
+  } else btnSince = 0;
+
+  static uint32_t lastSave = 0;
+  if (saveNow || now - lastSave > 15000) {
+    saveNow = false;
+    lastSave = now;
+    saveTrip();
+  }
+
+  // příjezd domů: stojím >3 s, ujeto >1 km, vidím domácí WiFi
+  static uint32_t lastScan = 0;
+  if (btConnected && prevSpeed == 0 && zeroSince && now - zeroSince > 3000 &&
+      trip.distKm >= ARRIVE_CHECK_KM && now - lastScan > 10000) {
+    lastScan = now;
+    bool home = homeVisible();
+    WiFi.mode(WIFI_OFF);
+    if (home) {
+      Serial.println("Doma -> konec jizdy, restart a odeslani");
+      txLed = true;
+      finishTrip();
+      SerialBT.disconnect();
+      delay(200);
+      ESP.restart();
+    }
+  }
+}
+
+// ---------------------- setup / loop ----------------------
+void setup() {
+  Serial.begin(115200);
+  oledInit();
+  pinMode(LED_POWER, OUTPUT);
+  pinMode(LED_OBD, OUTPUT);
+  pinMode(LED_TX, OUTPUT);
+  pinMode(BTN_BOOT, INPUT_PULLUP);
+  pinMode(BTN_PAGE, INPUT_PULLUP);
+  xTaskCreate(ledTask, "led", 2048, nullptr, 1, nullptr);
+  xTaskCreate(btnTask, "btn", 2048, nullptr, 1, nullptr);
+
+  prefs.begin("obd", false);
+  loadCfg();
+
+  // vstup do nastavení: nic nenastaveno / podržené BOOT / 3× rychle zapnuto
+  bool tlacitko = prefs.getUChar("portal", 0);
+  if (tlacitko) prefs.putUChar("portal", 0);
+  uint8_t zapnuti = 0;
+  if (esp_reset_reason() == ESP_RST_POWERON) {
+    zapnuti = prefs.getUChar("boots", 0) + 1;
+    prefs.putUChar("boots", zapnuti);
+  }
+  if (!configured() || tlacitko || zapnuti >= 3) {
+    prefs.putUChar("boots", 0);
+    runPortal();                                    // odtud se vrací jen restartem
+  }
+
+  introAnim();                                      // „Ahoj jméno“ na začátku
+
+  loadAll();
+
+  bool home = homeVisible();
+  Serial.printf("Domaci WiFi: %s\n", home ? "ANO" : "ne");
+
+  if (home) {
+    finishTrip();                                   // jsem doma = sloučená jízda skončila
+    txLed = true;
+    faze = 1;                                       // displej: odesílám
+    drawOled();
+    bool wifiOk = wifiConnect();
+    setWifiSt(wifiOk ? 2 : 1);
+    if (wifiOk) {
+      uint32_t nowEpoch = syncTime();
+      uint8_t odeslano = 0;
+      float   sT100 = 0, sT50 = 0, sKm = 0;         // souhrn odeslaných jízd pro tabulku
+      while (qCount > 0) {
+        if (!tgSendHtml(tripMsg(queue[0]))) break;
+        odeslano++;
+        if (queue[0].best0100 && (!sT100 || queue[0].best0100 / 1000.0f < sT100)) sT100 = queue[0].best0100 / 1000.0f;
+        if (queue[0].best050 && (!sT50 || queue[0].best050 / 1000.0f < sT50)) sT50 = queue[0].best050 / 1000.0f;
+        sKm += queue[0].distKm;
+        memmove(queue, queue + 1, sizeof(Trip) * (qCount - 1));
+        qCount--;
+        saveQueue();
+        drawOled();
+      }
+      if (!nowEpoch) nowEpoch = tgDate;             // internetový čas nešel -> čas z Telegramu
+      if (odeslano && nowEpoch) updateLeaderboard(nowEpoch, sT100, sT50, sKm);
+      faze = qCount ? 4 : 2;                        // 2 = hotovo, 4 = něco zůstalo
+      drawOled();
+      checkOta();                                   // při nové verzi se tu ESP aktualizuje a restartuje
+    } else {
+      faze = 4;
+      drawOled();
+    }
+    txLed = false;
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    startTrip();
+  } else {
+    WiFi.mode(WIFI_OFF);
+    if (!trip.open) startTrip();                    // jinak pokračuje rozjetá jízda
+  }
+
+  saveTrip();
+  onBase = trip.onSec - millis() / 1000;
+
+  SerialBT.begin("ESP_OBD", true);                  // true = ESP se připojuje k adaptéru
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  SerialBT.setPin(cfg.pin.c_str(), cfg.pin.length());
+#else
+  SerialBT.setPin(cfg.pin.c_str());
+#endif
+}
+
+void loop() {
+  if (!btConnected) {
+    static uint32_t nextTry = 0;
+    if (millis() >= nextTry) {
+      if (btConnect()) {
+        if (elmInit()) {
+          setObdSt(3);
+          btConnected = true;
+          errStreak = 0;
+          obdLed = 2;
+          faze = 0;                                 // nová jízda -> displej ukazuje jízdu
+          stranka = 0;                              // nová jízda -> stránka zrychlení
+          Serial.println("ELM OK");
+        } else {
+          setObdSt(2);
+          SerialBT.disconnect();
+          obdLed = 0;
+        }
+      } else {
+        setObdSt(1);
+        obdLed = 0;
+      }
+      nextTry = millis() + 5000;
+    }
+    periodic();
+    delay(50);
+    return;
+  }
+
+  int b[2];
+  uint32_t now = millis();
+
+  // rychlost – každou smyčku
+  if (queryPid("010D", "410D", 1, b)) onSpeed(b[0], millis());
+
+  // ostatní PIDy jen když nejedeme rozjezd, aby 0–100 měřilo přesně
+  if (!runActive) {
+    // otáčky – průběžně
+    if (queryPid("010C", "410C", 2, b)) {
+      int rpm = (b[0] * 256 + b[1]) / 4;
+      liveRpm = rpm;
+      if (rpm > trip.maxRpm) trip.maxRpm = rpm;
+    }
+
+    // PIDy jen pro stránku 1 (turbo a motor) – čtou se jen když je zobrazená
+    if (stranka == 1) {
+      static uint32_t tMap = 0;
+      if (now - tMap > 1000) {
+        tMap = now;
+        if (queryPid("010B", "410B", 1, b)) liveMap = b[0];          // tlak v sání kPa
+      }
+      static uint32_t tLoad = 0;
+      if (now - tLoad > 5000) {
+        tLoad = now;
+        if (queryPid("0104", "4104", 1, b)) liveLoad = (uint8_t)(b[0] * 100 / 255);
+        if (queryPid("010F", "410F", 1, b)) liveIat = b[0] - 40;
+      }
+    }
+
+    // chladicí kapalina a napětí – každých 15 s (i pro výstrahu)
+    static uint32_t tPomal = 0;
+    if (now - tPomal > 15000) {
+      tPomal = now;
+      if (queryPid("0105", "4105", 1, b)) {
+        int c = b[0] - 40;
+        liveCool = c;
+        if (c > trip.maxCoolant) trip.maxCoolant = c;
+      }
+      readVolt();
+    }
+
+    // stav poruch – až 3 pokusy
+    static uint8_t dtcTries = 0;
+    if (dtcTries < 3) {
+      dtcTries++;
+      if (queryPid("0101", "4101", 1, b)) {
+        trip.mil = (b[0] & 0x80) ? 1 : 0;
+        trip.dtc = b[0] & 0x7F;
+        dtcTries = 3;
+      }
+    }
+  }
+
+  if (errStreak >= 8 || !SerialBT.connected()) {
+    Serial.println("Spojeni s ELM ztraceno");
+    SerialBT.disconnect();
+    btConnected = false;
+    obdLed = 0;
+  }
+
+  periodic();
+}
